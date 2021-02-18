@@ -120,6 +120,7 @@
         , cb_module               :: module()
         , cb_config               :: term()
         , client                  :: brod:client()
+        , reset_offset_event_handler :: module() | undefined
         }).
 
 -type state() :: #state{}.
@@ -253,6 +254,7 @@ init(Config) ->
   DefaultGroupConfig = [],
   GroupConfig = maps:get(group_config, Config, DefaultGroupConfig),
   CbConfig = maps:get(init_data, Config, undefined),
+  ResetOffsetEventHandler = maps:get(reset_offset_event_handler, Config, undefined),
   ok = brod_utils:assert_client(Client),
   ok = brod_utils:assert_group_id(GroupId),
   ok = brod_utils:assert_topics(Topics),
@@ -270,6 +272,7 @@ init(Config) ->
                 , cb_module    = CbModule
                 , cb_config    = CbConfig
                 , group_id     = GroupId
+                , reset_offset_event_handler = ResetOffsetEventHandler
                 },
   {ok, State}.
 
@@ -452,6 +455,7 @@ maybe_start_worker( _MemberId
         , cb_config    = CbConfig
         , group_id     = GroupId
         , message_type = MessageType
+        , reset_offset_event_handler = ResetOffsetEventHandler
         } = State,
   TopicPartition = {Topic, Partition},
   case Workers of
@@ -476,6 +480,7 @@ maybe_start_worker( _MemberId
                               , Partition
                               , ConsumerConfig
                               , StartOptions
+                              , ResetOffsetEventHandler
                               ),
       NewWorkers = Workers #{TopicPartition => Pid},
       State#state{workers = NewWorkers}
@@ -487,17 +492,23 @@ maybe_start_worker( _MemberId
                   , brod:partition()
                   , brod:consumer_config()
                   , brod_group_subscriber_worker:start_options()
+                  , module() | undefined
                   ) -> {ok, pid()}.
 start_worker(Client, Topic, MessageType, Partition, ConsumerConfig,
-             StartOptions) ->
-  {ok, Pid} = brod_topic_subscriber:start_link( Client
-                                              , Topic
-                                              , [Partition]
-                                              , ConsumerConfig
-                                              , MessageType
-                                              , brod_group_subscriber_worker
-                                              , StartOptions
-                                              ),
+             StartOptions, ResetOffsetEventHandler) ->
+              
+  Args = #{ client          => Client
+          , topic           => Topic
+          , partitions      => [Partition]
+          , consumer_config => ConsumerConfig
+          , message_type    => MessageType
+          , cb_module       => brod_group_subscriber_worker
+          , init_data       => StartOptions
+          , reset_offset_event_handler => ResetOffsetEventHandler
+          },
+  {ok, Pid} = brod_topic_subscriber:start_link(Args),
+  monitor(process, Pid),
+  unlink(Pid),
   {ok, Pid}.
 
 -spec do_ack(brod:topic(), brod:partition(), brod:offset(), state()) ->

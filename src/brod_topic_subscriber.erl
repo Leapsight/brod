@@ -47,6 +47,7 @@
         ]).
 
 -include("brod_int.hrl").
+-include_lib("brod/include/brod.hrl").
 
 -type cb_state() :: term().
 -type cb_ret() :: {ok, cb_state()} | {ok, ack, cb_state()}.
@@ -128,6 +129,7 @@
         , cb_module      :: module()
         , cb_state       :: cb_state()
         , message_type   :: message | message_set
+        , reset_offset_event_handler :: module() | undefined
         }).
 
 -type state() :: #state{}.
@@ -279,6 +281,7 @@ init(Config) ->
    , message_type      := MessageType
    , consumer_config   := ConsumerConfig
    , partitions        := Partitions
+   , reset_offset_event_handler := ResetOffsetEventHandler
    } = maps:merge(Defaults, Config),
   {ok, CommittedOffsets, CbState} = CbModule:init(Topic, InitData),
   ok = brod_utils:assert_client(Client),
@@ -291,6 +294,7 @@ init(Config) ->
           , cb_module    = CbModule
           , cb_state     = CbState
           , message_type = MessageType
+          , reset_offset_event_handler = ResetOffsetEventHandler
           },
   {ok, State}.
 
@@ -355,6 +359,13 @@ handle_info({'DOWN', _Mref, process, Pid, Reason},
       %% not a consumer pid
       {noreply, State}
   end;
+handle_info({ConsumerPid, #kafka_fetch_error{topic = Topic,
+                                             partition = Partition,
+                                             error_code = offset_out_of_range}},
+             #state{reset_offset_event_handler = ResetOffsetEventHandler} = State)
+      when ResetOffsetEventHandler /= undefined->
+  gen_event:notify(ResetOffsetEventHandler, {reset_offset, Topic, Partition, self(), ConsumerPid}),
+  {noreply, State};
 handle_info(_Info, State) ->
   {noreply, State}.
 
