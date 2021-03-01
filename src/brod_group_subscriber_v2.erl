@@ -65,6 +65,7 @@
          , message_type    => message | message_set
          , consumer_config => brod:consumer_config()
          , group_config    => brod:group_config()
+         , reset_offset_event_handler => module()
          }.
 
 -type commit_fun() :: fun((brod:offset()) -> ok).
