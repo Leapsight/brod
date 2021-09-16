@@ -47,7 +47,7 @@
         ]).
 
 -include("brod_int.hrl").
--include_lib("brod/include/brod.hrl").
+-include("brod.hrl").
 
 -type cb_state() :: term().
 -type cb_ret() :: {ok, cb_state()} | {ok, ack, cb_state()}.
