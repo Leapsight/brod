@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2015-2018 Klarna Bank AB (publ)
+%%%   Copyright (c) 2015-2021 Klarna Bank AB (publ)
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -50,6 +50,9 @@
         , t_async_commit/1
         , t_consumer_crash/1
         , t_assign_partitions_handles_updating_state/1
+        , v2_coordinator_crash/1
+        , v2_subscriber_shutdown/1
+        , v2_subscriber_assignments_revoked/1
         ]).
 
 -define(MESSAGE_TIMEOUT, 30000).
@@ -91,6 +94,9 @@ groups() ->
      , t_2_members_one_partition
      , t_async_commit
      , t_assign_partitions_handles_updating_state
+     , v2_coordinator_crash
+     , v2_subscriber_shutdown
+     , v2_subscriber_assignments_revoked
      ]}
   ].
 
@@ -259,7 +265,7 @@ t_async_acks(Config) when is_list(Config) ->
      begin
        %% Produce some messages into the topic:
        {_, L} = produce_payloads(Topic, Partition, Config),
-       {ok, SubscriberPid} = start_subscriber(Config, [Topic], InitArgs),
+       {ok, SubscriberPid} = start_subscriber(?group_id, Config, [Topic], InitArgs),
        %% And ack/commit them asynchronously:
        [begin
           {ok, #{offset := Offset}} = ?wait_message(Topic, Partition, I, _),
@@ -288,7 +294,7 @@ t_consumer_crash(Config) when is_list(Config) ->
      #{ timeout => 5000 },
      %% Run stage:
      begin
-       {ok, SubscriberPid} = start_subscriber(Config, [Topic], InitArgs),
+       {ok, SubscriberPid} = start_subscriber(?group_id, Config, [Topic], InitArgs),
        %% send some messages
        [_, _, O3, _, O5] = [SendFun(I) || I <- lists:seq(1, 5)],
        %% Wait until the last one is processed
@@ -299,7 +305,7 @@ t_consumer_crash(Config) when is_list(Config) ->
        ok = Behavior:ack(SubscriberPid, Topic, Partition, O3),
        sys:get_state(SubscriberPid),
        {ok, ConsumerPid} = brod:get_consumer(?CLIENT_ID, Topic, Partition),
-       kafka_test_helper:kill_process(ConsumerPid),
+       kafka_test_helper:kill_process(ConsumerPid, kill),
        %% send more messages (but they should not be received until
        %% re-subscribe)
        [SendFun(I) || I <- lists:seq(6, 8)],
@@ -320,6 +326,126 @@ t_consumer_crash(Config) when is_list(Config) ->
          ?assertEqual( [<<I>> || I <- lists:seq(6, 8)]
                      , ?projection(value, handled_messages(AfterAck))
                      )
+     end).
+
+v2_coordinator_crash(Config) when is_list(Config) ->
+  %% Test that crash in group_coordinator leads to shutdown of the
+  %% group subscriber and its workers.
+  InitArgs = #{},
+  Topic = ?topic,
+  Partition = 0,
+  ?check_trace(
+     #{ timeout => 5000 },
+     %% Run stage:
+     begin
+       {ok, SubscriberPid} = start_subscriber(?group_id, Config, [Topic], InitArgs),
+       %% Send a message to the topic and wait until it's received to make sure the subscriber is stable:
+       produce({Topic, Partition}, <<0>>),
+       {ok, _} = ?wait_message(Topic, Partition, <<0>>, _),
+       %% Extract data from the subscriber:
+       {state, _, _, _, Coordinator, _, Workers, _, _, _, _} = sys:get_state(SubscriberPid),
+       true = is_pid(Coordinator), % assert
+       Monitors = [monitor(process, Worker) || Worker <- [SubscriberPid|maps:values(Workers)]],
+       %% Kill the coordinator process:
+       unlink(SubscriberPid),
+       kafka_test_helper:kill_process(Coordinator, kill),
+       %% Verify that all the worker processes and the group subscriber itself got terminated:
+       [receive
+          {_Tag, MRef, _Type, _Obj, _Info} -> ok
+        after 5000 ->
+            error("Child processes didn't die")
+        end
+        || MRef <- Monitors],
+       ok
+     end,
+     %% Check stage:
+     fun(_Ret, Trace) ->
+         ok
+     end).
+
+v2_subscriber_shutdown(Config) when is_list(Config) ->
+  %% Test graceful shutdown of the group subscriber:
+  InitArgs = #{async_ack => true},
+  Topic = ?topic,
+  Partition = 0,
+  Tester = self(),
+  Ref = make_ref(),
+  meck:new(brod_group_coordinator, [passthrough, no_passthrough_cover, no_history]),
+  meck:expect(brod_group_coordinator, commit_offsets,
+              fun(Pid) ->
+                      Tester ! {commit_offsets, Ref},
+                      meck:passthrough([Pid])
+              end),
+  ?check_trace(
+     #{ timeout => 5000 },
+     %% Run stage:
+     begin
+       {ok, SubscriberPid} = start_subscriber(?group_id, Config, [Topic], InitArgs),
+       %% Send a message to the topic and wait until it's received to make sure the subscriber is stable:
+       produce({Topic, Partition}, <<0>>),
+       {ok, _} = ?wait_message(Topic, Partition, <<0>>, _),
+       %% Extract data from the subscriber:
+       {state, _, _, _, Coordinator, _, Workers, _, _, _, _} = sys:get_state(SubscriberPid),
+       true = is_pid(Coordinator), % assert
+       Monitors = [monitor(process, Worker) || Worker <- [Coordinator|maps:values(Workers)]],
+       %% Kill the subscriber process:
+       unlink(SubscriberPid),
+       kafka_test_helper:kill_process(SubscriberPid, shutdown),
+       %% Verify that all the process got shotdown:
+       [receive
+          {_Tag, MRef, _Type, _Obj, _Info} -> ok
+        after 5000 ->
+            error("Child processes didn't die")
+        end
+        || MRef <- Monitors],
+       receive
+           {commit_offsets, Ref} -> ok
+       after 5000 ->
+           error("timed out waiting for offset flush")
+       end,
+       ok
+     end,
+     %% Check stage:
+     fun(_Ret, Trace) ->
+         ok
+     end),
+  meck:unload(brod_group_coordinator).
+
+v2_subscriber_assignments_revoked(Config) when is_list(Config) ->
+  %% Test brod_group_subscriber_v2 behaviour when assignments revoked:
+  InitArgs = #{async_ack => true},
+  Topic = ?topic,
+  Partition = 0,
+  ?check_trace(
+     #{ timeout => 5000 },
+     %% Run stage:
+     begin
+       {ok, SubscriberPid} = start_subscriber(?group_id, Config, [Topic], InitArgs),
+
+       %% Send a message to the topic and wait until it's received to make sure the subscriber is stable:
+       produce({Topic, Partition}, <<0>>),
+       {ok, _} = ?wait_message(Topic, Partition, <<0>>, _),
+
+       %% Extract data from the subscriber:
+       {state, _, _, _, Coordinator, _, Workers, _, _, _, _} = sys:get_state(SubscriberPid),
+       WorkerMonitors = [monitor(process, Worker) || Worker <- maps:values(Workers)],
+
+       %% revoke assignments
+       ok = brod_group_subscriber_v2:assignments_revoked(SubscriberPid),
+       %% Verify that all the worker processes were terminated
+       [receive
+          {'DOWN', MRef, process, _Pid, _Reason} -> ok
+        after 5000 ->
+            error("expected all workers to be stopped, but at least one process is still running")
+        end
+        || MRef <- WorkerMonitors],
+
+       ?assert(is_process_alive(SubscriberPid)),
+       ok
+     end,
+     %% Check stage:
+     fun(_Ret, Trace) ->
+         ok
      end).
 
 t_2_members_subscribe_to_different_topics(topics) ->
@@ -346,8 +472,8 @@ t_2_members_subscribe_to_different_topics(Config) when is_list(Config) ->
      #{ timeout => 5000 },
      %% Run stage:
      begin
-       {ok, SubscriberPid1} = start_subscriber(Config, [Topic1], InitArgs),
-       {ok, SubscriberPid2} = start_subscriber(Config, [Topic2], InitArgs),
+       {ok, SubscriberPid1} = start_subscriber(?group_id, Config, [Topic1], InitArgs),
+       {ok, SubscriberPid2} = start_subscriber(?group_id, Config, [Topic2], InitArgs),
        %% Send messages to random partitions:
        lists:foreach(SendFun, L),
        ?wait_message(_, _, LastMsg, _)
@@ -374,8 +500,8 @@ t_2_members_one_partition(Config) when is_list(Config) ->
        %% Send messages:
        {LastOffset, L} = produce_payloads(Topic, 0, Config),
        %% Start two subscribers competing for the partition:
-       {ok, SubscriberPid1} = start_subscriber(Config, [Topic], InitArgs),
-       {ok, SubscriberPid2} = start_subscriber(Config, [Topic], InitArgs),
+       {ok, SubscriberPid1} = start_subscriber(?group_id, Config, [Topic], InitArgs),
+       {ok, SubscriberPid2} = start_subscriber(?group_id, Config, [Topic], InitArgs),
        ?wait_message(_, _, _, LastOffset),
        L
      end,
@@ -406,7 +532,7 @@ t_async_commit(Config) when is_list(Config) ->
                          , {partition_restart_delay_seconds, 1}
                          , {begin_offset, Offset}
                          ],
-        {ok, SubscriberPid} = start_subscriber(Config, [Topic],
+        {ok, SubscriberPid} = start_subscriber(?group_id, Config, [Topic],
                                                GroupConfig, ConsumerConfig,
                                                InitArgs),
         SubscriberPid
@@ -496,7 +622,7 @@ t_assign_partitions_handles_updating_state(Config) when is_list(Config) ->
   InitArgs = #{ async_ack         => true
               , assign_partitions => true
               },
-  {ok, SubscriberPid} = start_subscriber( Config, [?topic], GroupConfig
+  {ok, SubscriberPid} = start_subscriber( ?group_id, Config, [?topic], GroupConfig
                                         , ConsumerConfig, InitArgs),
   %% Since we only care about the assign_partitions part, we don't need to
   %% send and receive messages.
@@ -520,7 +646,7 @@ rand_uniform(Max) ->
   {_, _, Micro} = os:timestamp(),
   Micro rem Max.
 
-start_subscriber(Config, Topics, InitArgs) ->
+start_subscriber(GroupId, Config, Topics, InitArgs) ->
   %% use consumer managed offset commit behaviour by default, so we
   %% can control where to start fetching messages from
   DefaultGroupConfig = [ {offset_commit_policy, consumer_managed}
@@ -540,13 +666,9 @@ start_subscriber(Config, Topics, InitArgs) ->
                                       , Config
                                       , DefaultConsumerConfig
                                       ),
-  start_subscriber(Config, Topics, GroupConfig, ConsumerConfig, InitArgs).
+  start_subscriber(GroupId, Config, Topics, GroupConfig, ConsumerConfig, InitArgs).
 
-start_subscriber(Config, Topics, GroupConfig, ConsumerConfig, InitArgs) ->
-  GroupId = case ?config(group_id) of
-              undefined -> ?group_id;
-              A         -> A
-            end,
+start_subscriber(GroupId, Config, Topics, GroupConfig, ConsumerConfig, InitArgs) ->
   {ok, SubscriberPid} =
     case ?config(behavior) of
      brod_group_subscriber_v2 ->

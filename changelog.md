@@ -1,8 +1,28 @@
-* TBD
+* 3.16.1
+  * Fix `brod` script in `brod-cli` in release.
+  * Support `rebalance_timeout` consumer group option
+* 3.16.0
+  * Update to kafka-protocol v4.0.1
+* 3.15.6
+  * Eliminate long-lived anonymous function closures
+* 3.15.5
+  * Fix exponential growth of `brod_producer` buffer
+* 3.15.4
+  * Avoid start_link for temp connection usages
+    affected APIs: fetch_committed_offsets, fetch, resolve_offset, create_topics, delete_topics
+* 3.15.3
+  * Try to commit acknowledged offsets when brod_group_subscriber_v2 terminates
+  * Fix process leak, close connection after offset is fetched in brod_utils:fetch_committed_offsets/3
+* 3.15.2
+  * Producer: Do not format producer buffer in `gen_server` state
+  * Consumer: Do not commit offsets when `unknown_member_id` error is received
+  * Logging: Changed from `error_logger` to `logger` macros
+  * Don't shut down brod_group_subscriber_v2 on previous generation worker termination
+  * Fix brod_group_subscriber_v2 crash on shutdown
   * Use GitHub Actions instead of Travis CI
   * Added Elixir example
   * Rename DEFAULT_TIMEOUT macro in public brod.hrl to BROD_DEFAULT_TIMEOUT.
-* 3.15.0
+* 3.15.0 (and 3.15.1, for some reason tagged on the same commit)
   * Fix unknown types
   * Build on OTP-23
 * 3.14.0

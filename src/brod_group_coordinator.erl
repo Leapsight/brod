@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2016-2018 Klarna Bank AB (publ)
+%%%   Copyright (c) 2016-2021 Klarna Bank AB (publ)
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
         , commit_offsets/2
         , start_link/6
         , update_topics/2
+        , stop/1
         ]).
 
 -export([ code_change/3
@@ -48,6 +49,7 @@
 
 %% default configs
 -define(SESSION_TIMEOUT_SECONDS, 30).
+-define(REBALANCE_TIMEOUT_SECONDS, ?SESSION_TIMEOUT_SECONDS).
 -define(HEARTBEAT_RATE_SECONDS, 5).
 -define(PROTOCOL_TYPE, <<"consumer">>).
 -define(MAX_REJOIN_ATTEMPTS, 5).
@@ -130,9 +132,10 @@
           %% The referece of the timer which triggers offset commit
         , offset_commit_timer :: ?undef | reference()
 
-          %% configs, see start_link/5 doc for details
+          %% configs, see start_link/6 doc for details
         , partition_assignment_strategy  :: partition_assignment_strategy()
         , session_timeout_seconds        :: pos_integer()
+        , rebalance_timeout_seconds      :: pos_integer()
         , heartbeat_rate_seconds         :: pos_integer()
         , max_rejoin_attempts            :: non_neg_integer()
         , rejoin_delay_seconds           :: non_neg_integer()
@@ -179,7 +182,7 @@
 %%        partitions.</li>
 %%  </ul></li>
 %%
-%%  <li>`session_timeout_seconds' (optional, default = 10)
+%%  <li>`session_timeout_seconds' (optional, default = 30)
 %%
 %%      Time in seconds for the group coordinator broker to consider a member
 %%      'down' if no heartbeat or any kind of requests received from a broker
@@ -187,7 +190,15 @@
 %%      A group member may also consider the coordinator broker 'down' if no
 %%      heartbeat response response received in the past N seconds.</li>
 %%
-%%  <li>`heartbeat_rate_seconds' (optional, default = 2)
+%%
+%%  <li>`rebalance_timeout_seconds' (optional, default = 30)
+%%
+%%      Time in seconds for each worker to join the group once a rebalance
+%%      has begun. If the timeout is exceeded, then the worker will be
+%%      removed from the group, which will cause offset commit failures.</li>
+%%
+%%
+%%  <li>`heartbeat_rate_seconds' (optional, default = 5)
 %%
 %%      Time in seconds for the member to 'ping' the group coordinator.
 %%      OBS: Care should be taken when picking the number, on one hand, we do
@@ -293,6 +304,16 @@ commit_offsets(CoordinatorPid, Offsets0) ->
 update_topics(CoordinatorPid, Topics) ->
   gen_server:cast(CoordinatorPid, {update_topics, Topics}).
 
+%% @doc Stop group coordinator, wait for pid `DOWN' before return.
+-spec stop(pid()) -> ok.
+stop(Pid) ->
+  Mref = erlang:monitor(process, Pid),
+  exit(Pid, shutdown),
+  receive
+    {'DOWN', Mref, process, Pid, _Reason} ->
+      ok
+  end.
+
 %%%_* gen_server callbacks =====================================================
 
 init({Client, GroupId, Topics, Config, CbModule, MemberPid}) ->
@@ -303,6 +324,7 @@ init({Client, GroupId, Topics, Config, CbModule, MemberPid}) ->
   PaStrategy = GetCfg(partition_assignment_strategy,
                       ?PARTITION_ASSIGMENT_STRATEGY_ROUNDROBIN),
   SessionTimeoutSec = GetCfg(session_timeout_seconds, ?SESSION_TIMEOUT_SECONDS),
+  RebalanceTimeoutSec = GetCfg(rebalance_timeout_seconds, ?REBALANCE_TIMEOUT_SECONDS),
   HbRateSec = GetCfg(heartbeat_rate_seconds, ?HEARTBEAT_RATE_SECONDS),
   MaxRejoinAttempts = GetCfg(max_rejoin_attempts, ?MAX_REJOIN_ATTEMPTS),
   RejoinDelaySeconds = GetCfg(rejoin_delay_seconds, ?REJOIN_DELAY_SECONDS),
@@ -321,6 +343,7 @@ init({Client, GroupId, Topics, Config, CbModule, MemberPid}) ->
           , member_module                  = CbModule
           , partition_assignment_strategy  = PaStrategy
           , session_timeout_seconds        = SessionTimeoutSec
+          , rebalance_timeout_seconds      = RebalanceTimeoutSec
           , heartbeat_rate_seconds         = HbRateSec
           , max_rejoin_attempts            = MaxRejoinAttempts
           , rejoin_delay_seconds           = RejoinDelaySeconds
@@ -359,6 +382,8 @@ handle_info({'EXIT', Pid, Reason}, #state{member_pid = Pid} = State) ->
     normal        -> {stop, normal, State};
     _             -> {stop, member_down, State}
   end;
+handle_info({'EXIT', _Pid, _Reason}, State) ->
+  {stop, shutdown, State};
 handle_info(?LO_CMD_SEND_HB,
             #state{ hb_ref                  = HbRef
                   , session_timeout_seconds = SessionTimeoutSec
@@ -485,11 +510,13 @@ stabilize(#state{ rejoin_delay_seconds = RejoinDelaySeconds
 
   %% 3. try to commit current offsets before re-joinning the group.
   %%    try only on the first re-join attempt
-  %%    do not try if it was illegal generation exception received
-  %%    because it will fail on the same exception again
+  %%    do not try if it was illegal generation or unknown member id
+  %%    exception received because it will fail on the same exception
+  %%    again
   State2 =
     case AttemptNo =:= 0 andalso
-         Reason    =/= ?illegal_generation of
+         Reason    =/= ?illegal_generation andalso
+         Reason    =/= ?unknown_member_id of
       true ->
         {ok, #state{} = State2_} = try_commit_offsets(State1),
         State2_;
@@ -565,14 +592,15 @@ should_reset_member_id(_) ->
   false.
 
 -spec join_group(state()) -> {ok, state()}.
-join_group(#state{ groupId                 = GroupId
-                 , memberId                = MemberId0
-                 , topics                  = Topics
-                 , connection              = Connection
-                 , session_timeout_seconds = SessionTimeoutSec
-                 , protocol_name           = ProtocolName
-                 , member_module           = MemberModule
-                 , member_pid              = MemberPid
+join_group(#state{ groupId                    = GroupId
+                 , memberId                   = MemberId0
+                 , topics                     = Topics
+                 , connection                 = Connection
+                 , session_timeout_seconds    = SessionTimeoutSec
+                 , rebalance_timeout_seconds  = RebalanceTimeoutSec
+                 , protocol_name              = ProtocolName
+                 , member_module              = MemberModule
+                 , member_pid                 = MemberPid
                  } = State0) ->
   Meta =
     [ {version, ?BROD_CONSUMER_GROUP_PROTOCOL_VERSION}
@@ -580,23 +608,25 @@ join_group(#state{ groupId                 = GroupId
     , {user_data, user_data(MemberModule, MemberPid)}
     ],
   Protocol =
-    [ {protocol_name, ProtocolName}
-    , {protocol_metadata, Meta}
+    [ {name, ProtocolName}
+    , {metadata, Meta}
     ],
   SessionTimeout = timer:seconds(SessionTimeoutSec),
+  RebalanceTimeout = timer:seconds(RebalanceTimeoutSec),
   Body =
     [ {group_id, GroupId}
-    , {session_timeout, SessionTimeout}
+    , {session_timeout_ms, SessionTimeout}
+    , {rebalance_timeout_ms, RebalanceTimeout}
     , {member_id, MemberId0}
     , {protocol_type, ?PROTOCOL_TYPE}
-    , {group_protocols, [Protocol]}
+    , {protocols, [Protocol]}
     ],
   Req = brod_kafka_request:join_group(Connection, Body),
   %% send join group request and wait for response
   %% as long as the session timeout config
   RspBody = send_sync(Connection, Req, SessionTimeout),
   GenerationId = kpro:find(generation_id, RspBody),
-  LeaderId = kpro:find(leader_id, RspBody),
+  LeaderId = kpro:find(leader, RspBody),
   MemberId = kpro:find(member_id, RspBody),
   Members0 = kpro:find(members, RspBody),
   Members1 = translate_members(Members0),
@@ -623,13 +653,13 @@ sync_group(#state{ groupId       = GroupId
     [ {group_id, GroupId}
     , {generation_id, GenerationId}
     , {member_id, MemberId}
-    , {group_assignment, assign_partitions(State)}
+    , {assignments, assign_partitions(State)}
     ],
   SyncReq = brod_kafka_request:sync_group(Connection, ReqBody),
   %% send sync group request and wait for response
   RspBody = send_sync(Connection, SyncReq),
   %% get my partition assignments
-  Assignment = kpro:find(member_assignment, RspBody),
+  Assignment = kpro:find(assignment, RspBody),
   TopicAssignments = get_topic_assignments(State, Assignment),
   ok = MemberModule:assignments_received(MemberPid, MemberId,
                                          GenerationId, TopicAssignments),
@@ -716,16 +746,16 @@ do_commit_offsets_(#state{ groupId                  = GroupId
     brod_utils:group_per_key(
       fun({{Topic, Partition}, Offset}) ->
         PartitionOffset =
-          [ {partition, Partition}
-          , {offset, Offset + 1} %% +1 since roundrobin_v2 protocol
-          , {metadata, Metadata}
+          [ {partition_index, Partition}
+          , {committed_offset, Offset + 1} %% +1 since roundrobin_v2 protocol
+          , {committed_metadata, Metadata}
           ],
         {Topic, PartitionOffset}
       end, AckedOffsets),
   TopicOffsets =
     lists:map(
       fun({Topic, PartitionOffsets}) ->
-          [ {topic, Topic}
+          [ {name, Topic}
           , {partitions, PartitionOffsets}
           ]
       end, TopicOffsets0),
@@ -738,12 +768,12 @@ do_commit_offsets_(#state{ groupId                  = GroupId
     [ {group_id, GroupId}
     , {generation_id, GenerationId}
     , {member_id, MemberId}
-    , {retention_time, Retention}
+    , {retention_time_ms, Retention}
     , {topics, TopicOffsets}
     ],
   Req = brod_kafka_request:offset_commit(Connection, ReqBody),
   RspBody = send_sync(Connection, Req),
-  Topics = kpro:find(responses, RspBody),
+  Topics = kpro:find(topics, RspBody),
   ok = assert_commit_response(Topics),
   NewState = State#state{acked_offsets = []},
   {ok, NewState}.
@@ -763,7 +793,7 @@ assert_commit_response(Topics) ->
 collect_commit_response_error_codes(Topics) ->
   lists:foldl(
     fun(Topic, Acc1) ->
-        Partitions = kpro:find(partition_responses, Topic),
+        Partitions = kpro:find(partitions, Topic),
         lists:foldl(
           fun(Partition, Acc2) ->
               EC = kpro:find(error_code, Partition),
@@ -804,7 +834,7 @@ assign_partitions(State) when ?IS_LEADER(State) ->
                       ]
                   end, Topics_),
       [ {member_id, MemberId}
-      , {member_assignment,
+      , {assignment,
          [ {version, ?BROD_CONSUMER_GROUP_PROTOCOL_VERSION}
          , {topic_partitions, PartitionAssignments}
          , {user_data, <<>>}
@@ -832,7 +862,7 @@ translate_members(Members) ->
   lists:map(
     fun(Member) ->
         MemberId = kpro:find(member_id, Member),
-        Meta = kpro:find(member_metadata, Member),
+        Meta = kpro:find(metadata, Member),
         Version = kpro:find(version, Meta),
         Topics = kpro:find(topics, Meta),
         UserData = kpro:find(user_data, Meta),
@@ -933,16 +963,16 @@ get_committed_offsets(#state{ offset_commit_policy = commit_to_kafka_v2
   RspBody = send_sync(Conn, Req),
   %% error_code is introduced in version 2
   ?ESCALATE_EC(kpro:find(error_code, RspBody, ?no_error)),
-  TopicOffsets = kpro:find(responses, RspBody),
+  TopicOffsets = kpro:find(topics, RspBody),
   CommittedOffsets0 =
     lists:map(
       fun(TopicOffset) ->
-        Topic = kpro:find(topic, TopicOffset),
-        PartitionOffsets = kpro:find(partition_responses, TopicOffset),
+        Topic = kpro:find(name, TopicOffset),
+        PartitionOffsets = kpro:find(partitions, TopicOffset),
         lists:foldl(
           fun(PartitionOffset, Acc) ->
-            Partition = kpro:find(partition, PartitionOffset),
-            Offset0 = kpro:find(offset, PartitionOffset),
+            Partition = kpro:find(partition_index, PartitionOffset),
+            Offset0 = kpro:find(committed_offset, PartitionOffset),
             Metadata = kpro:find(metadata, PartitionOffset),
             EC = kpro:find(error_code, PartitionOffset),
             ?ESCALATE_EC(EC),

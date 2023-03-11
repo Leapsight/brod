@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2014-2020, Klarna Bank AB (publ)
+%%%   Copyright (c) 2014-2021, Klarna Bank AB (publ)
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -93,7 +93,7 @@ create_topics(Hosts, TopicConfigs, RequestConfigs) ->
                     validate_only => boolean()}, conn_config()) ->
         {ok, kpro:struct()} | {error, any()} | ok.
 create_topics(Hosts, TopicConfigs, RequestConfigs, ConnCfg) ->
-  with_conn(kpro:connect_controller(Hosts, ConnCfg),
+  with_conn(kpro:connect_controller(Hosts, nolink(ConnCfg)),
             fun(Pid) ->
                 Request = brod_kafka_request:create_topics(
                   Pid, TopicConfigs, RequestConfigs),
@@ -110,7 +110,7 @@ delete_topics(Hosts, Topics, Timeout) ->
 -spec delete_topics([endpoint()], [topic()], pos_integer(), conn_config()) ->
         {ok, kpro:struct()} | {error, any()}.
 delete_topics(Hosts, Topics, Timeout, ConnCfg) ->
-  with_conn(kpro:connect_controller(Hosts, ConnCfg),
+  with_conn(kpro:connect_controller(Hosts, nolink(ConnCfg)),
               fun(Pid) ->
                   Request = brod_kafka_request:delete_topics(
                     Pid, Topics, Timeout),
@@ -160,7 +160,8 @@ resolve_offset(Hosts, Topic, Partition, Time, ConnCfg) ->
         {ok, offset()} | {error, any()}.
 resolve_offset(Hosts, Topic, Partition, Time, ConnCfg, Opts) ->
   with_conn(
-    kpro:connect_partition_leader(Hosts, ConnCfg, Topic, Partition, Opts),
+    kpro:connect_partition_leader(Hosts, nolink(ConnCfg),
+                                  Topic, Partition, Opts),
     fun(Pid) -> resolve_offset(Pid, Topic, Partition, Time) end).
 
 %% @doc Resolve timestamp or semantic offset to real offset.
@@ -284,7 +285,7 @@ fetch(Hosts, Topic, Partition, Offset, Opts) when is_list(Hosts) ->
   fetch({Hosts, []}, Topic, Partition, Offset, Opts);
 fetch({Hosts, ConnCfg}, Topic, Partition, Offset, Opts) ->
   with_conn(
-    kpro:connect_partition_leader(Hosts, ConnCfg, Topic, Partition),
+    kpro:connect_partition_leader(Hosts, nolink(ConnCfg), Topic, Partition),
     fun(Conn) -> fetch(Conn, Topic, Partition, Offset, Opts) end);
 fetch(Client, Topic, Partition, Offset, Opts) when is_atom(Client) ->
   case brod_client:get_leader_connection(Client, Topic, Partition) of
@@ -306,7 +307,7 @@ fold(Hosts, Topic, Partition, Offset, Opts,
   fold({Hosts, []}, Topic, Partition, Offset, Opts, Acc, Fun, Limits);
 fold({Hosts, ConnCfg}, Topic, Partition, Offset, Opts, Acc, Fun, Limits) ->
   case with_conn(
-         kpro:connect_partition_leader(Hosts, ConnCfg, Topic, Partition),
+         kpro:connect_partition_leader(Hosts, nolink(ConnCfg), Topic, Partition),
          fun(Conn) -> fold(Conn, Topic, Partition, Offset, Opts,
                            Acc, Fun, Limits) end) of
     {error, Reason} ->
@@ -377,7 +378,7 @@ init_sasl_opt(Config) ->
 fetch_committed_offsets(BootstrapEndpoints, ConnCfg, GroupId, Topics) ->
   Args = #{type => group, id => GroupId},
   with_conn(
-    kpro:connect_coordinator(BootstrapEndpoints, ConnCfg, Args),
+    kpro:connect_coordinator(BootstrapEndpoints, nolink(ConnCfg), Args),
     fun(Pid) -> do_fetch_committed_offsets(Pid, GroupId, Topics) end).
 
 %% @doc Fetch commited offsets for the given topics in a consumer group.
@@ -393,7 +394,9 @@ fetch_committed_offsets(Client, GroupId, Topics) ->
     {ok, {Endpoint, ConnCfg}} ->
       case kpro:connect(Endpoint, ConnCfg) of
         {ok, Conn} ->
-          do_fetch_committed_offsets(Conn, GroupId, Topics);
+          Rsp = do_fetch_committed_offsets(Conn, GroupId, Topics),
+          kpro:close_connection(Conn),
+          Rsp;
         {error, Reason} ->
           {error, Reason}
       end;
@@ -409,8 +412,7 @@ get_sasl_opt(Config) ->
       %% Module should implement kpro_auth_backend behaviour
       {callback, Module, Args};
     {Mechanism, File} when is_list(File) orelse is_binary(File) ->
-      {User, Pass} = read_sasl_file(File),
-      {Mechanism, User, Pass};
+      {Mechanism, File};
     Other ->
       Other
   end.
@@ -424,7 +426,7 @@ do_fetch_committed_offsets(Conn, GroupId, Topics) when is_pid(Conn) ->
   Req = brod_kafka_request:offset_fetch(Conn, GroupId, Topics),
   case request_sync(Conn, Req) of
     {ok, Msg} ->
-      {ok, kf(responses, Msg)};
+      {ok, kpro:find(topics, Msg)};
     {error, Reason} ->
       {error, Reason}
   end.
@@ -462,8 +464,8 @@ fetch(Conn, ReqFun, Offset, MaxBytes) ->
         [{endpoint(), [brod:cg()] | {error, any()}}].
 list_all_groups(Endpoints, Options) ->
   {ok, Metadata} = get_metadata(Endpoints, [], Options),
-  Brokers0 = kf(brokers, Metadata),
-  Brokers = [{binary_to_list(kf(host, B)), kf(port, B)} || B <- Brokers0],
+  Brokers0 = kpro:find(brokers, Metadata),
+  Brokers = [{binary_to_list(kpro:find(host, B)), kpro:find(port, B)} || B <- Brokers0],
   lists:foldl(
     fun(Broker, Acc) ->
         case list_groups(Broker, Options) of
@@ -484,8 +486,8 @@ list_groups(Endpoint, ConnCfg) ->
           Groups =
             lists:map(
               fun(Struct) ->
-                  Id = kf(group_id, Struct),
-                  Type = kf(protocol_type, Struct),
+                  Id = kpro:find(group_id, Struct),
+                  Type = kpro:find(protocol_type, Struct),
                   #brod_cg{ id = Id
                           , protocol_type = Type
                           }
@@ -738,16 +740,6 @@ replace_prop(Key, Value, PropL0) ->
   PropL = proplists:delete(Key, PropL0),
   [{Key, Value} | PropL].
 
-%% Read a regular file, assume it has two lines:
-%% First line is the sasl-plain username
-%% Second line is the password
--spec read_sasl_file(file:name_all()) -> {binary(), binary()}.
-read_sasl_file(File) ->
-  {ok, Bin} = file:read_file(File),
-  Lines = binary:split(Bin, <<"\n">>, [global]),
-  [User, Pass] = lists:filter(fun(Line) -> Line =/= <<>> end, Lines),
-  {User, Pass}.
-
 %% A fetched batch may contain offsets earlier than the
 %% requested begin-offset because the batch might be compressed on
 %% kafka side. Here we drop the leading messages.
@@ -763,9 +755,6 @@ drop_old_messages(BeginOffset, [Message | Rest] = All) ->
 -spec ok_when(boolean(), any()) -> ok | no_return().
 ok_when(true, _) -> ok;
 ok_when(_, Reason) -> erlang:error(Reason).
-
--spec kf(kpro:field_name(), kpro:struct()) -> kpro:field_value().
-kf(FieldName, Struct) -> kpro:find(FieldName, Struct).
 
 with_conn({ok, Pid}, Fun) ->
   try
@@ -792,7 +781,7 @@ parse(list_offsets, _, Msg) ->
     #{offset := _} = M -> M
   end;
 parse(metadata, _, Msg) ->
-  ok = throw_error_code(kpro:find(topic_metadata, Msg)),
+  ok = throw_error_code(kpro:find(topics, Msg)),
   Msg;
 parse(find_coordinator, _, Msg) ->
   ok = throw_error_code([Msg]),
@@ -818,9 +807,9 @@ parse(list_groups, _, Msg) ->
   ok = throw_error_code([Msg]),
   kpro:find(groups, Msg);
 parse(create_topics, _, Msg) ->
-  ok = throw_error_code(kpro:find(topic_errors, Msg));
+  ok = throw_error_code(kpro:find(topics, Msg));
 parse(delete_topics, _, Msg) ->
-  ok = throw_error_code(kpro:find(topic_error_codes, Msg));
+  ok = throw_error_code(kpro:find(responses, Msg));
 parse(init_producer_id, _, Msg) ->
   ok = throw_error_code([Msg]),
   Msg;
@@ -923,6 +912,9 @@ foldl_batch(Fun, Acc, [Msg | Rest]) ->
 is_batch([M | _]) when is_map(M) -> true;
 is_batch([T | _]) when is_tuple(T) -> true;
 is_batch(_) -> false.
+
+nolink(C) when is_list(C) -> [{nolink, true} | C];
+nolink(C) when is_map(C) -> C#{nolink => true}.
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:

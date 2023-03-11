@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2019 Klarna Bank AB (publ)
+%%%   Copyright (c) 2019-2021 Klarna Bank AB (publ)
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -101,8 +101,6 @@
 
 -optional_callbacks([assign_partitions/3, get_committed_offset/3, terminate/2]).
 
--define(DOWN(Reason), {down, brod_utils:os_time_utc_str(), Reason}).
-
 -type worker() :: pid().
 
 -type workers() :: #{brod:topic_partition() => worker()}.
@@ -116,7 +114,7 @@
         { config                  :: subscriber_config()
         , message_type            :: message | message_set
         , group_id                :: brod:group_id()
-        , coordinator             :: pid()
+        , coordinator             :: undefined | pid()
         , generation_id           :: integer() | ?undef
         , workers = #{}           :: workers()
         , committed_offsets = #{} :: committed_offsets()
@@ -177,7 +175,8 @@ start_link(Config) ->
 -spec stop(pid()) -> ok.
 stop(Pid) ->
   Mref = erlang:monitor(process, Pid),
-  ok = gen_server:cast(Pid, stop),
+  unlink(Pid),
+  exit(Pid, shutdown),
   receive
     {'DOWN', Mref, process, Pid, _Reason} ->
       ok
@@ -251,6 +250,7 @@ init(Config) ->
    , topics    := Topics
    , cb_module := CbModule
    } = Config,
+  process_flag(trap_exit, true),
   MessageType = maps:get(message_type, Config, message_set),
   DefaultGroupConfig = [],
   GroupConfig = maps:get(group_config, Config, DefaultGroupConfig),
@@ -352,8 +352,6 @@ handle_cast({new_assignments, MemberId, GenerationId, Assignments},
                      , Assignments
                      ),
   {noreply, State};
-handle_cast(stop, State) ->
-  {stop, normal, State};
 handle_cast(_Cast, State) ->
   {noreply, State}.
 
@@ -363,16 +361,16 @@ handle_cast(_Cast, State) ->
 %% Handling all non call/cast messages
 %% @end
 %%--------------------------------------------------------------------
-handle_info({'DOWN', Mref, process, Pid, Reason}, State) ->
-  L = [TP || {TP, Pid1} <- maps:to_list(State#state.workers), Pid1 =:= Pid],
-  case L of
-    [] ->
-      ?BROD_LOG_WARNING("Received DOWN message from unknown process.~n"
-                        "  pid = ~p~n  ref = ~p~n  reason = ~p",
-                        [Pid, Mref, Reason]),
-      {noreply, State};
-    [TopicPartition|_] ->
-      handle_worker_failure(TopicPartition, Pid, Reason, State)
+handle_info({'EXIT', Pid, _Reason}, #state{coordinator = Pid} = State) ->
+    {stop, {shutdown, coordinator_failure}, State#state{coordinator = undefined}};
+handle_info({'EXIT', Pid, Reason}, State) ->
+  case [TP || {TP, Pid1} <- maps:to_list(State#state.workers), Pid1 =:= Pid] of
+    [TopicPartition | _] ->
+      ok = handle_worker_failure(TopicPartition, Pid, Reason, State),
+      {stop, shutdown, State};
+    _ -> % Other process wants to kill us, supervisor?
+      ?BROD_LOG_INFO("Received EXIT:~p from ~p, shutting down", [Reason, Pid]),
+      {stop, shutdown, State}
   end;
 handle_info(_Info, State) ->
   {noreply, State}.
@@ -385,29 +383,38 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 -spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
                 State :: term()) -> any().
-terminate(_Reason, #state{ workers = Workers
+terminate(_Reason, #state{workers = Workers,
+                          coordinator = Coordinator,
+                          group_id = GroupId
                          }) ->
-  terminate_all_workers(Workers),
-  ok.
+  ok = terminate_all_workers(Workers),
+  ok = flush_offset_commits(GroupId, Coordinator).
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
 
+%% best-effort commits flush, this is a synced call,
+%% worst case scenario, it may timeout after 5 seconds.
+flush_offset_commits(GroupId, Coordinator) when is_pid(Coordinator) ->
+    case brod_group_coordinator:commit_offsets(Coordinator) of
+        ok -> ok;
+        {error, Reason} ->
+            ?BROD_LOG_ERROR("group_subscriber_v2 ~s failed to flush commits "
+                            "before termination ~p", [GroupId, Reason])
+    end;
+flush_offset_commits(_, _) ->
+    ok.
+
 -spec handle_worker_failure(brod:topic_partition(), pid(), term(), state()) ->
-                               no_return().
+        ok.
 handle_worker_failure({Topic, Partition}, Pid, Reason, State) ->
-  #state{ workers     = Workers
-        , group_id    = GroupId
-        , coordinator = Coordinator
-        } = State,
+  #state{group_id = GroupId} = State,
   ?BROD_LOG_ERROR("group_subscriber_v2 worker crashed.~n"
-                  "  group_id = ~s~n  topic = ~s~n  paritition = ~p~n"
+                  "  group_id = ~s~n  topic = ~s~n  partition = ~p~n"
                   "  pid = ~p~n  reason = ~p",
                   [GroupId, Topic, Partition, Pid, Reason]),
-  terminate_all_workers(Workers),
-  brod_group_coordinator:commit_offsets(Coordinator),
-  exit(worker_crash).
+  ok.
 
 -spec terminate_all_workers(workers()) -> ok.
 terminate_all_workers(Workers) ->
@@ -423,6 +430,7 @@ terminate_all_workers(Workers) ->
 terminate_worker(WorkerPid) ->
   case is_process_alive(WorkerPid) of
     true ->
+      unlink(WorkerPid),
       brod_topic_subscriber:stop(WorkerPid);
     false ->
       ok
@@ -499,8 +507,6 @@ start_worker(Client, Topic, MessageType, Partition, ConsumerConfig,
           , reset_offset_event_handler => ResetOffsetEventHandler
           },
   {ok, Pid} = brod_topic_subscriber:start_link(Args),
-  monitor(process, Pid),
-  unlink(Pid),
   {ok, Pid}.
 
 -spec do_ack(brod:topic(), brod:partition(), brod:offset(), state()) ->

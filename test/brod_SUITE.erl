@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2019, Klarna Bank AB (publ)
+%%%   Copyright (c) 2019-2021, Klarna Bank AB (publ)
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -63,11 +63,11 @@ t_create_topics(Config) when is_list(Config) ->
   Topic = <<"test-create-topic">>,
   TopicConfig = [
     #{
-      config_entries => [],
+      configs => [],
       num_partitions => 1,
-      replica_assignment => [],
+      assignments => [],
       replication_factor => 1,
-      topic => Topic
+      name => Topic
     }
   ],
   ?assertEqual(ok,

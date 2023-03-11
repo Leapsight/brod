@@ -1,5 +1,5 @@
 %%%
-%%%   Copyright (c) 2017-2018 Klarna Bank AB (publ)
+%%%   Copyright (c) 2017-2021 Klarna Bank AB (publ)
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -146,7 +146,7 @@ supported_versions(API) ->
     offset_commit    -> {2, 2};
     offset_fetch     -> {1, 2};
     find_coordinator -> {0, 0};
-    join_group       -> {0, 0};
+    join_group       -> {0, 1};
     heartbeat        -> {0, 0};
     leave_group      -> {0, 0};
     sync_group       -> {0, 0};

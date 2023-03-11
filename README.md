@@ -1,4 +1,8 @@
-[![Build Status](https://travis-ci.org/klarna/brod.svg?branch=master)](https://travis-ci.org/klarna/brod) [![Coverage Status](https://coveralls.io/repos/github/klarna/brod/badge.svg?branch=master)](https://coveralls.io/github/klarna/brod?branch=master)
+![brod](https://github.com/kafka4beam/brod/workflows/brod/badge.svg?branch=master)
+# NOTICE
+
+This product includes software developed by
+[Klarna Bank AB (publ)](https://www.klarna.com)
 
 # Brod - Apache Kafka Client for Erlang/Elixir
 
@@ -20,6 +24,8 @@ Why "brod"? [http://en.wikipedia.org/wiki/Max_Brod](http://en.wikipedia.org/wiki
 * Pick latest supported version when sending requests to kafka.
 * Direct APIs for message send/fetch and cluster inspection/management without having to start clients/producers/consumers.
 * A escriptized command-line tool for message send/fetch and cluster inspection/management.
+* Configurable compression library. `snappy` compression is supported by default.
+  For more compression options, see [kafka_protocol/README](https://github.com/kafka4beam/kafka_protocol/blob/master/README.md#compression-support)
 
 # Building and testing
 
@@ -519,7 +525,5 @@ brod commits -b localhost:9092 -i the-group-id -t topic-name -o "0:10000" --prot
 
 ## TODOs
 
-* HTML tagged EDoc
 * Support scram-sasl in brod-cli
-* lz4 compression & decompression
 * Transactional produce APIs
